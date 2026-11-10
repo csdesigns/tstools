@@ -31,9 +31,14 @@ mandir=$HOME/.local/man' to install without root privileges.
 macOS
 -----
 
-The build is supported on current macOS (verified on arm64 / macOS 27.x with
-the Xcode toolchain). Note that Apple's libtool no longer builds dynamic
-libraries: 'libtool -dynamic' was removed in recent releases, so
-libtstools.dylib is built with 'clang -dynamiclib' instead. The command line
-tools link the static library (libtstools.a), which libtool -static still
-builds as before.
+This fork is maintained for Apple Silicon (arm64 / ARM) macOS, and is the
+fork to build from source on an ARM Mac. It is verified on arm64 /
+macOS 27.x with the Xcode toolchain.
+
+Note that Apple's libtool no longer builds dynamic libraries: 'libtool
+-dynamic' was removed in recent releases, so libtstools.dylib is built with
+'clang -dynamiclib' instead. The command line tools link the static library
+(libtstools.a), which libtool -static still builds as before.
+
+The tools are built as native arm64 binaries. On an Apple Silicon Mac they
+run natively; no Rosetta translation is required.

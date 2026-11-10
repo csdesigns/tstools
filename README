@@ -14,3 +14,26 @@ The tools are focused on:
 * Reporting on TS packets (tsreport) or ES units/frames/fields (esreport)
 * Simple manipulation of stream data (es2ts, esfilter, esreverse, esmerge, ts2es)
 * Streaming of data, possibly with introduced errors (tsplay)
+
+Building
+--------
+
+Build with GNU make:
+
+    make
+    sudo make install
+
+The tools are installed into $(prefix)/bin (default /usr/local/bin) and the
+man pages into /usr/local/man/man1. Override the destinations with, for
+example, 'make install prefix=$HOME/.local bindir=$HOME/.local/bin
+mandir=$HOME/.local/man' to install without root privileges.
+
+macOS
+-----
+
+The build is supported on current macOS (verified on arm64 / macOS 27.x with
+the Xcode toolchain). Note that Apple's libtool no longer builds dynamic
+libraries: 'libtool -dynamic' was removed in recent releases, so
+libtstools.dylib is built with 'clang -dynamiclib' instead. The command line
+tools link the static library (libtstools.a), which libtool -static still
+builds as before.

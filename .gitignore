@@ -3,3 +3,6 @@
 /obj/
 /w32/
 
+# macOS
+*.DS_Store
+

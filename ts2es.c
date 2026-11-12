@@ -217,24 +217,43 @@ static int extract_pid_packets(TS_reader_p  tsreader,
         if (need_packet_start)
           need_packet_start = FALSE;
 
-        pes_packet_len = (payload[4] << 8) | payload[5];
-        if (verbose) fprint_msg("PES packet length %d\n",pes_packet_len);
-        got_pes_packet_len = (pes_packet_len > 0);
-
-        if (IS_H222_PES(payload))
+        // Unwrapped AAC (ADTS, ISO/IEC 13818-7): the access unit starts
+        // with the 0xFFF sync (byte 1 is 0xF0-0xF3) and layer '00'.
+        // There is no PES header to strip - and reading payload[4..5]
+        // as a "PES packet length" would just give ADTS header bytes,
+        // so we must not clamp continuation packets to it either.
+        // Without this check the MPEG-1 PES heuristics below mangled
+        // every ADTS frame header (dropping several bytes per frame).
+        if (payload_len >= 7 && payload[0] == 0xFF &&
+            (payload[1] & 0xF0) == 0xF0 && ((payload[1] >> 1) & 3) == 0)
         {
-          // It's H.222.0 - payload[8] is the PES_header_data_length,
-          // so our ES data starts that many bytes after that field
-          offset = payload[8] + 9;
+          if (verbose)
+            fprint_msg("Unwrapped AAC (ADTS) - passing raw data\n");
+          got_pes_packet_len = FALSE;
+          data = payload;
+          data_len = payload_len;
         }
         else
         {
-          // We assume it's MPEG-1
-          offset = calc_mpeg1_pes_offset(payload,payload_len);
+          pes_packet_len = (payload[4] << 8) | payload[5];
+          if (verbose) fprint_msg("PES packet length %d\n",pes_packet_len);
+          got_pes_packet_len = (pes_packet_len > 0);
+
+          if (IS_H222_PES(payload))
+          {
+            // It's H.222.0 - payload[8] is the PES_header_data_length,
+            // so our ES data starts that many bytes after that field
+            offset = payload[8] + 9;
+          }
+          else
+          {
+            // We assume it's MPEG-1
+            offset = calc_mpeg1_pes_offset(payload,payload_len);
+          }
+          data = &payload[offset];
+          data_len = payload_len-offset;
+          if (verbose) print_data(TRUE,"data",data,data_len,1000);
         }
-        data = &payload[offset];
-        data_len = payload_len-offset;
-        if (verbose) print_data(TRUE,"data",data,data_len,1000);
       }
       else
       {

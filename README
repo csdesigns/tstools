@@ -42,3 +42,37 @@ Note that Apple's libtool no longer builds dynamic libraries: 'libtool
 
 The tools are built as native arm64 binaries. On an Apple Silicon Mac they
 run natively; no Rosetta translation is required.
+
+Changes in this fork
+--------------------
+
+### ts2es: pass unwrapped AAC (ADTS) through unchanged (2026-11-12)
+
+Upstream ts2es assumes that every elementary stream in a transport
+stream is PES-wrapped: at each payload-unit start it reads
+payload[4..5] as the PES packet length and runs any non-H.222 payload
+through the MPEG-1 PES header heuristics (calc_mpeg1_pes_offset()).
+For unwrapped AAC (ADTS, stream type 0x0F, ISO/IEC 13818-7) - a
+compliant and common way of carrying AAC in a TS - that logic mangles
+every frame: the ADTS sync (0xFFF) falls into the "MPEG-1 PES"
+branch, which drops header bytes from each frame ("### MPEG-1 PES
+packet has 0xfX instead of..." errors) and clamps continuation
+packets against the bogus "PES length", so the extracted ES is
+shorter than the real payload and will not decode.
+
+ts2es now detects the ADTS sync at the start of a payload unit
+(0xFF, byte 1 in 0xF0-0xF3 with the layer bits '00') and passes the
+data through raw, without any PES-length clamping. PES-wrapped
+streams (video, MPEG-1 audio, ...) are handled exactly as before;
+output on such content is byte-identical to upstream.
+
+### Known limitations (unchanged from upstream)
+
+- tsinfo only parses PAT and PMT. It does not read TDT/TM (system
+  time) or EIT at all: an invalid TDT BCD date/time (or any EIT
+  content) produces no tsinfo warning - silence from tsinfo about
+  system time means nothing.
+- ts2es still assumes PES wrapping for video and other non-ADTS
+  streams: raw Annex B H.264 carried without PES in a TS is not
+  extracted faithfully (the MPEG-1 PES heuristics may drop bytes).
+  Raw MP2/MP3 audio is affected in the same way.

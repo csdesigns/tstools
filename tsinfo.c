@@ -48,6 +48,182 @@
 
 
 /*
+ * Parse a BCD byte from an EN 300 468 time field.
+ *
+ * - `b` is the byte to parse
+ * - `allow_binary_day` accepts the EN 300 468 encoding of days
+ *   26-31 as 0x1A-0x1F (a quirk that comes from the 4-bit date field
+ *   and that some multiplexers also apply to the 8-bit day field)
+ *
+ * Returns 1 and sets *value on success, 0 if the byte is not valid BCD
+ * (or a binary-day value when not allowed).
+ */
+static int tdt_parse_bcd(int b,int allow_binary_day,int *value)
+{
+  if (allow_binary_day && 0x1A <= b && b <= 0x1F)
+  {
+    *value = b - 0x1A + 26;
+    return 1;
+  }
+  if ((b >> 4) > 9 || (b & 0xF) > 9)
+    return 0;
+  *value = (b >> 4) * 10 + (b & 0xF);
+  return 1;
+}
+
+/*
+ * Validate and report on a TDT (0x13) or TM (0x14) section
+ * (ISO/IEC 13818-1, EN 300 468 6.5).
+ *
+ * - `packet_num` is the 1-based TS packet number (for reporting)
+ * - `pid` is the PID the section was found on
+ * - `sec` points at the table_id byte (i.e., after the pointer_field)
+ * - `sec_avail` is the number of payload bytes available from `sec`
+ *
+ * These are single-packet sections; section_length is 16 and the
+ * section is 19 bytes total:
+ *
+ *   table_id(8)
+ *   section_syntax_indicator(1) '0'(1) reserved(2) section_length(12)
+ *   TSI(16) version_number(5) current_next_indicator(1)
+ *   section_number(8) last_section_number(8)
+ *   BCD_seconds(8) BCD_minutes(8) BCD_hours(8)
+ *   [reserved(4) even_minute(1) leap_second(1)](8)
+ *   BCD_year(8) BCD_month(8) BCD_day(8)
+ *   CRC_32(32)
+ *
+ * The time is UTC for TDT and local time for TM. Invalid BCD, fields
+ * out of range, wrong section size and CRC mismatches are reported in
+ * the usual ### / !!! style.
+ */
+static void report_tdt_section(int        packet_num,
+                               uint32_t   pid,
+                               int        verbose,
+                               const byte *sec,
+                               int        sec_avail)
+{
+  int    table_id = sec[0];
+  int    section_length;
+  int    valid;
+  int    ss,mi,hh,yy,mo,dy;
+  const char *name = (table_id == 0x13)?"TDT":"TM";
+
+  if (sec_avail < 3)
+    return;                        // cannot even read the length
+  section_length = ((sec[1] & 0xF) << 8) | sec[2];
+
+  if (section_length != 16)
+  {
+    fprint_err("### %s section length is %d, should be 16"
+               " (packet %d, PID %04x)\n",
+               name,section_length,packet_num,pid);
+    return;
+  }
+  if (sec_avail < 19)
+  {
+    fprint_err("### %s section is incomplete: have %d bytes after the"
+               " length field, need 16 (packet %d, PID %04x)\n",
+               name,sec_avail-3,packet_num,pid);
+    return;
+  }
+
+  if (verbose && (sec[1] & 0xF0) != 0xF0)
+    fprint_err("!!! %s section header bits are %02x, not 1110"
+               " (packet %d, PID %04x)\n",
+               name,sec[1] & 0xF0,packet_num,pid);
+
+  // CRC check (same convention as the PAT/PMT checks)
+  {
+    uint32_t check_crc = crc32_block(0xffffffff,(byte *)sec,19);
+    if (check_crc != 0)
+      fprint_err("!!! Calculated CRC for %s is %08x, not 00000000"
+                 " (packet %d, PID %04x)\n",
+                 name,check_crc,packet_num,pid);
+  }
+
+  valid = TRUE;
+  if (!tdt_parse_bcd(sec[8],FALSE,&ss))
+  {
+    fprint_err("### %s seconds byte 0x%02x is not valid BCD"
+               " (packet %d, PID %04x)\n",name,sec[8],packet_num,pid);
+    valid = FALSE;
+  }
+  if (!tdt_parse_bcd(sec[9],FALSE,&mi))
+  {
+    fprint_err("### %s minutes byte 0x%02x is not valid BCD"
+               " (packet %d, PID %04x)\n",name,sec[9],packet_num,pid);
+    valid = FALSE;
+  }
+  if (!tdt_parse_bcd(sec[10],FALSE,&hh))
+  {
+    fprint_err("### %s hours byte 0x%02x is not valid BCD"
+               " (packet %d, PID %04x)\n",name,sec[10],packet_num,pid);
+    valid = FALSE;
+  }
+  if (!tdt_parse_bcd(sec[12],FALSE,&yy))
+  {
+    fprint_err("### %s year byte 0x%02x is not valid BCD"
+               " (packet %d, PID %04x)\n",name,sec[12],packet_num,pid);
+    valid = FALSE;
+  }
+  if (!tdt_parse_bcd(sec[13],FALSE,&mo))
+  {
+    fprint_err("### %s month byte 0x%02x is not valid BCD"
+               " (packet %d, PID %04x)\n",name,sec[13],packet_num,pid);
+    valid = FALSE;
+  }
+  if (!tdt_parse_bcd(sec[14],TRUE,&dy))
+  {
+    fprint_err("### %s day byte 0x%02x is not valid BCD"
+               " (packet %d, PID %04x)\n",name,sec[14],packet_num,pid);
+    valid = FALSE;
+  }
+  if (!valid)
+    return;
+
+  if (mo < 1 || mo > 12)
+  {
+    fprint_err("### %s month %d is out of range 1-12"
+               " (packet %d, PID %04x)\n",name,mo,packet_num,pid);
+    return;
+  }
+  if (dy < 1 || dy > 31)
+  {
+    fprint_err("### %s day %d is out of range 1-31"
+               " (packet %d, PID %04x)\n",name,dy,packet_num,pid);
+    return;
+  }
+  if (hh > 23)
+  {
+    fprint_err("### %s hour %d is out of range 0-23"
+               " (packet %d, PID %04x)\n",name,hh,packet_num,pid);
+    return;
+  }
+  if (mi > 59)
+  {
+    fprint_err("### %s minute %d is out of range 0-59"
+               " (packet %d, PID %04x)\n",name,mi,packet_num,pid);
+    return;
+  }
+  if (ss > 59)
+  {
+    fprint_err("### %s second %d is out of range 0-59"
+               " (packet %d, PID %04x)\n",name,ss,packet_num,pid);
+    return;
+  }
+
+  {
+    int year = (yy < 70)?2000+yy:1900+yy;
+    if (verbose)
+      fprint_msg("Packet %d is %s with PID %04x (%d)\n",
+                 packet_num,name,pid,pid);
+    fprint_msg("%s time (packet %d, PID %04x): %04d-%02d-%02d %02d:%02d:%02d %s\n",
+               name,packet_num,pid,year,mo,dy,hh,mi,ss,
+               (table_id == 0x13)?"UTC":"local time");
+  }
+}
+
+/*
  * Report on the program streams, by looking at the PAT and PMT packets
  * in the first `max` TS packets of the given input stream
  *
@@ -80,6 +256,10 @@ static int report_streams(TS_reader_p tsreader,
 
   int num_pats = 0;
   int num_pmts = 0;
+  int num_tdts = 0;
+  int num_tms  = 0;
+  byte  last_tdt_sec[19];
+  int   have_last_tdt = FALSE;
 
   fprint_msg("Scanning %d TS packets\n",max);
 
@@ -269,11 +449,51 @@ static int report_streams(TS_reader_p tsreader,
       free_pmt(&last_pmt);
       last_pmt = this_pmt;
     }
+    else if (payload_unit_start_indicator && payload_len > 1)
+    {
+      // TDT (0x13) and TM (0x14) can appear on a PID that is not known
+      // in advance, so sniff PUSI payloads for the table id. A PSI
+      // section starts with a pointer_field (0x00 for these
+      // single-packet tables); otherwise the section starts at the
+      // beginning of the payload.
+      const byte  *sec = payload;
+      int          sec_avail = payload_len;
+
+      if (payload[0] == 0)
+      {
+        sec = payload + 1;
+        sec_avail = payload_len - 1;
+      }
+
+      if (sec_avail >= 3 && (sec[0] == 0x13 || sec[0] == 0x14))
+      {
+        if (sec[0] == 0x13)
+          num_tdts++;
+        else
+          num_tms++;
+
+        // Report each distinct section once, so a table that repeats
+        // every few packets does not flood the output.
+        {
+          int cmp_len = (sec_avail < 19)?sec_avail:19;
+          if (!have_last_tdt || memcmp(sec,last_tdt_sec,cmp_len) != 0)
+          {
+            have_last_tdt = TRUE;
+            memcpy(last_tdt_sec,sec,cmp_len);
+            report_tdt_section(ii+1,pid,verbose,sec,sec_avail);
+          }
+        }
+      }
+    }
   }
 
   fprint_msg("\nFound %d PAT packet%s and %d PMT packet%s in %d TS packets\n",
              num_pats,(num_pats==1?"":"s"),
              num_pmts,(num_pmts==1?"":"s"),max);
+  if (num_tdts || num_tms)
+    fprint_msg("Found %d TDT packet%s and %d TM packet%s\n",
+               num_tdts,(num_tdts==1?"":"s"),
+               num_tms,(num_tms==1?"":"s"));
 
   free_pidint_list(&last_prog_list);
   free_pmt(&last_pmt);

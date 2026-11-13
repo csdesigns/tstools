@@ -66,12 +66,35 @@ data through raw, without any PES-length clamping. PES-wrapped
 streams (video, MPEG-1 audio, ...) are handled exactly as before;
 output on such content is byte-identical to upstream.
 
+### tsinfo: TDT/TM detection, validation and reporting (2026-11-12)
+
+Upstream tsinfo parses only PAT and PMT: it never looks at TDT/TM
+(system time), so a corrupt TDT - for example a month byte of 0xbb
+that is not valid BCD - passed through silently.
+
+tsinfo now sniffs PUSI payloads for TDT (0x13) and TM (0x14)
+sections on any PID (their PIDs are not known in advance, so this
+works without SDT parsing), and for each distinct section it:
+
+- checks the section size (section_length 16, 19 bytes total);
+- checks the section CRC-32 (init 0xFFFFFFFF, the same convention as
+  the PAT/PMT checks);
+- validates the BCD date/time fields (year, month, day, hour,
+  minute, second), accepting the EN 300 468 binary encodings of days
+  26-31 (0x1A-0x1F), and range-checks them (month 1-12, day 1-31,
+  hour 0-23, minute/second 0-59);
+- reports the decoded time: UTC for TDT, local time for TM.
+
+Findings are reported in the usual ### / !!! style, once per
+distinct section, so a table repeating every few packets does not
+flood the output. Muxes without TDT/TM produce exactly the same
+output as upstream.
+
 ### Known limitations (unchanged from upstream)
 
-- tsinfo only parses PAT and PMT. It does not read TDT/TM (system
-  time) or EIT at all: an invalid TDT BCD date/time (or any EIT
-  content) produces no tsinfo warning - silence from tsinfo about
-  system time means nothing.
+- tsinfo still does not parse EIT at all: an invalid EIT (or any
+  other table's content) produces no tsinfo warning. TDT/TM are now
+  covered (see above).
 - ts2es still assumes PES wrapping for video and other non-ADTS
   streams: raw Annex B H.264 carried without PES in a TS is not
   extracted faithfully (the MPEG-1 PES heuristics may drop bytes).

@@ -46,6 +46,52 @@ run natively; no Rosetta translation is required.
 Changes in this fork
 --------------------
 
+### ts2es: full H.222.0 PES unwrap - start code anywhere in PUSI, straddling headers, exact unit lengths (2026-11-13)
+
+Upstream ts2es (and this fork's first ADTS fix) assumed that a PES
+header, when present, starts at payload[0] of the PUSI packet. Real
+muxes do not guarantee this: a PUSI packet carries the tail of the
+previous elementary stream unit (any length) followed by the start
+of the next unit, so the PES start code can appear anywhere in the
+payload - and it (or the whole header) can straddle a TS packet
+boundary. That produced two classes of failure:
+
+- streams whose units do not align with packet starts had their
+  leading unit-tail bytes dropped, or had ES bytes interpreted as a
+  PES header, silently corrupting the output;
+- for unwrapped streams, payload[4..5] was read as a "PES packet
+  length" and continuation packets were clamped to it, silently
+  dropping data. The ADTS entry below avoided that for ADTS only,
+  and its per-packet guard misfired on H.264 payloads that happen
+  to begin with FF F0-FF (common in macroblock data).
+
+ts2es now implements the H.222.0 unwrap the way demuxers do:
+
+- at each PUSI the payload is scanned for the first PES start code
+  ('00 00 01' + stream id, with the H.222.0 marker-bit check for
+  ids 0xC0-0xFF); bytes before it are the tail of the previous unit
+  and are written as-is;
+- start code and header bytes that straddle into the next TS packet
+  are staged (from the start code) and re-parsed when the
+  continuation packet arrives;
+- a non-zero PES_packet_length defines the unit's ES size
+  (declared - (3 + header_length) octets) and is honoured as a
+  write budget across packets; when a declared-length unit ends
+  inside a PUSI packet, the next unit starts right there and is
+  scanned for in place (a start-code prefix straddling out of the
+  packet is staged for the continuation);
+- unwrapped streams (raw ADTS, raw Annex B, ...) are passed through
+  byte-for-byte when no start code is found, with no length
+  clamping. Stream type is detected stickily: the first PES start
+  code seen turns ADTS/raw treatment off for good, and a stream
+  whose first PUSI payloads all begin with the 0xFFF ADTS sync and
+  contain no start code is treated as unwrapped ADTS.
+
+Streams where every unit starts exactly at payload[0] and no header
+straddles a packet produce output byte-identical to upstream.
+MPEG-1 PS (pack/system, ids 0xB9-0xBF) still uses the legacy
+calc_mpeg1_pes_offset() approximation, unchanged.
+
 ### ts2es: pass unwrapped AAC (ADTS) through unchanged (2026-11-12)
 
 Upstream ts2es assumes that every elementary stream in a transport
@@ -95,7 +141,11 @@ output as upstream.
 - tsinfo still does not parse EIT at all: an invalid EIT (or any
   other table's content) produces no tsinfo warning. TDT/TM are now
   covered (see above).
-- ts2es still assumes PES wrapping for video and other non-ADTS
-  streams: raw Annex B H.264 carried without PES in a TS is not
-  extracted faithfully (the MPEG-1 PES heuristics may drop bytes).
-  Raw MP2/MP3 audio is affected in the same way.
+- Unwrapped (non-PES) streams - raw Annex B H.264, raw MP2/MP3,
+  ADTS - are now passed through byte-for-byte (see the 2026-11-13
+  entry). The one case that can still corrupt output is an
+  accidental '00 00 01' + id (>= 0xB8) + H.222.0 marker pattern
+  inside the elementary stream itself (for example in H.264 SEI
+  user data): it will be parsed as a PES header at that position.
+  MPEG-1 PS (ids 0xB9-0xBF) still relies on the legacy header
+  heuristics.

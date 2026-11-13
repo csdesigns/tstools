@@ -60,6 +60,217 @@ typedef enum pid_extract EXTRACT;
 
 
 /*
+ * Find the first candidate PES start code within b[from..len).
+ *
+ * A candidate is '00 00 01' followed by a byte >= 0xB8 (MPEG-1 PS
+ * pack/system/PSM ids 0xB9-0xBF, or H.222.0 stream ids 0xC0-0xFF).
+ * Stream ids 0xC0-0xFF must carry the H.222.0 marker bits in the
+ * octet after the 16-bit length field; a mid-NAL '00 00 01 xx'
+ * pattern usually fails this and is skipped. A candidate near the
+ * end of the buffer (marker octet not visible) is accepted and
+ * resolved when the header completes in the next packet.
+ *
+ * Returns the offset of the start code, or -1 if none was found.
+ */
+static int find_pes_start(const byte *b, int len, int from)
+{
+  int  i;
+
+  for (i = from; i + 3 < len; i++)
+  {
+    if (b[i] == 0 && b[i+1] == 0 && b[i+2] == 1 && b[i+3] >= 0xB8)
+    {
+      if (b[i+3] >= 0xC0 && i + 6 < len && (b[i+6] & 0xC0) != 0x80)
+        continue;
+      return i;
+    }
+  }
+  return -1;
+}
+
+/*
+ * Write a chunk of ES data, dying if the write fails.
+ *
+ * Returns 0 on success, 1 on error.
+ */
+static int write_es_bytes(FILE         *output,
+                          const byte   *data,
+                          int           len)
+{
+  if (len > 0)
+  {
+    // Windows doesn't seem to like writing 0 bytes, so be careful...
+    size_t  written = fwrite(data,len,1,output);
+    if (written != 1)
+    {
+      fprint_err("### Error writing TS packet - units written = %d\n",
+                 (int)written);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/*
+ * Given a start code at buf[f], parse the PES header.
+ *
+ * On success sets *pos (the ES offset within buf) and *unit_left (the
+ * unit's ES size, 0 when unknown) and returns 0. If the header does
+ * not complete within buf, the staged state (pend/pend_len/hdr_total)
+ * is updated for the next packet and 1 is returned.
+ */
+static int parse_pes_header(byte      *buf,
+                            int         blen,
+                            int         f,
+                            byte       *pend,
+                            int        *pend_len,
+                            int        *hdr_total,
+                            int        *pos,
+                            int        *unit_left,
+                            int         verbose)
+{
+  int  declared;
+  int  hd;
+
+  if (buf[f+3] < 0xC0)
+  {
+    // MPEG-1 PS (pack/system/PSM ids 0xB9-0xBF): no reliable 16-bit
+    // PES length exists, so just drop the header.
+    int  off = calc_mpeg1_pes_offset(buf + f,blen - f);
+
+    *pos = f + off;
+    if (*pos > blen)
+      *pos = blen;   // legacy approximation: assume the header fits
+    *unit_left = 0;
+    return 0;
+  }
+
+  // H.222.0: the ES data starts PES_header_data_length bytes after
+  // the 16-bit length field (9 bytes from the start code). All field
+  // offsets are anchored on the three-byte view '00 00 01', which is
+  // the same whether the start code was written with three or four
+  // zero bytes. PES_packet_length (when non-zero) counts octets from
+  // after the length field, so the PES carries declared - (3 + hd)
+  // ES octets.
+  if (f + 8 >= blen)
+  {
+    // The header doesn't complete in this buffer: stage it.
+    if (verbose)
+      fprint_msg("PES header spills into next packet\n");
+    memcpy(pend,buf + f,blen - f);
+    *pend_len = blen - f;
+    *hdr_total = 0;
+    return 1;
+  }
+
+  declared = (buf[f+4] << 8) | buf[f+5];
+  hd = buf[f+8];
+  *pos = f + 9 + hd;
+  *unit_left = 0;
+  if (declared > 0)
+  {
+    *unit_left = declared - (3 + hd);
+    if (*unit_left < 0)
+      *unit_left = 0;
+    if (verbose)
+      fprint_msg("PES packet length %d (%d ES bytes)\n",
+                 declared,*unit_left);
+  }
+
+  if (*pos > blen)
+  {
+    // The header fits, but the ES starts in the next buffer: stage
+    // the (complete) header bytes.
+    memcpy(pend,buf + f,blen - f);
+    *pend_len = blen - f;
+    *hdr_total = 9 + hd;
+    return 1;
+  }
+  return 0;
+}
+
+/*
+ * Write the current unit's ES from buf[pos] onward. When a
+ * declared-length unit ends inside the buffer, the next unit starts
+ * right after it: scan for and parse that start (this is only ever
+ * called for PUSI packets, the only place a new unit may start).
+ *
+ * Returns 0 on success (state updated), 1 on a write error.
+ */
+static int emit_unit_es(byte      *buf,
+                        int         blen,
+                        int        *pos,
+                        byte       *pend,
+                        int        *pend_len,
+                        int        *hdr_total,
+                        int        *unit_left,
+                        FILE       *output)
+{
+  int  f;
+
+  for (;;)
+  {
+    int  avail = blen - *pos;
+    int  w = avail;
+
+    if (*unit_left > 0 && w > *unit_left)
+      w = *unit_left;
+    if (write_es_bytes(output,buf + *pos,w))
+      return 1;
+    *pos += w;
+
+    if (*unit_left == 0)
+      break;             // unknown-length unit carries on
+    *unit_left -= w;
+    if (*unit_left > 0)
+      break;             // unit continues in later packets
+
+    // A declared-length unit ended right here.
+    if (*pos >= blen)
+      break;
+    f = find_pes_start(buf,blen,*pos);
+    if (f < 0)
+    {
+      // No start code visible: the next unit's start code may
+      // straddle into the next packet (at most 3 bytes here). Hold
+      // a start-code prefix; preserve anything else (malformed).
+      int  rest = blen - *pos;
+      int  prefix = 0;
+
+      if (rest == 3 && buf[*pos] == 0 && buf[*pos+1] == 0 &&
+          buf[*pos+2] == 1)
+        prefix = 3;
+      else
+        while (prefix < rest && buf[*pos + prefix] == 0)
+          prefix ++;
+      if (prefix > 0 && prefix == rest)
+      {
+        memcpy(pend,buf + *pos,rest);
+        *pend_len = rest;
+        *hdr_total = 0;
+      }
+      else if (rest > 0)
+      {
+        if (write_es_bytes(output,buf + *pos,rest))
+          return 1;
+        *pos += rest;
+      }
+      break;
+    }
+    if (f > *pos)
+    {
+      // Gap bytes between units (shouldn't happen): preserve.
+      if (write_es_bytes(output,buf + *pos,f - *pos))
+        return 1;
+    }
+    if (parse_pes_header(buf,blen,f,pend,pend_len,hdr_total,
+                         pos,unit_left,FALSE))
+      break;             // staged for the next packet
+  }
+  return 0;
+}
+
+/*
  * Extract all the TS packets for either a video or audio stream.
  *
  * Returns 0 if all went well, 1 if something went wrong.
@@ -156,8 +367,25 @@ static int extract_pid_packets(TS_reader_p  tsreader,
   int    err;
   int    count = 0;
   int    extracted = 0;
-  int    pes_packet_len = 0;
-  int    got_pes_packet_len = FALSE;
+  // H.222.0 PES-unwrap state. A PES header (max 9 + 255 = 264 bytes)
+  // can straddle TS packet boundaries, so header bytes are staged here
+  // (from the start code) until the header is complete.
+  byte   pes_pend[288];
+  int    pes_pend_len  = 0;   // staged header bytes
+  int    pes_hdr_total = 0;   // staged header size (9 + hd); 0 = unknown
+  int    pes_unit_left = 0;   // ES bytes remaining for the current unit
+  int    pes_unit_open = FALSE;
+  // Sticky stream-type detection for the ADTS guard: ADTS and
+  // PES-wrapped streams are byte-indistinguishable in a single packet
+  // (an H.264 payload can begin with FF F0..FF just like ADTS, and an
+  // AAC frame body can contain '00 00 01' runs that look like PES
+  // candidates). First PES start code seen wins: it turns ADTS
+  // treatment off for good. A stream whose first few PUSI payloads all
+  // begin with the ADTS sync and yield no start code is treated as
+  // unwrapped ADTS.
+  int    adts_stream = FALSE;
+  int    pes_stream = FALSE;
+  int    pusi_seen = 0;
   // It doesn't make sense to start outputting data for our PID until we
   // get the start of a packet
   int    need_packet_start = TRUE;
@@ -194,10 +422,6 @@ static int extract_pid_packets(TS_reader_p  tsreader,
 
     if (pid == pid_wanted)
     {
-      byte  *data;
-      int    data_len;
-      size_t written;
-
       if (verbose)
       {
         fprint_msg("%4d: TS Packet PID %04x",count,pid);
@@ -211,52 +435,225 @@ static int extract_pid_packets(TS_reader_p  tsreader,
 
       if (payload_unit_start_indicator)
       {
-        // It's the start of a PES packet, so we need to drop the header
-        int offset;
+        // A PUSI marks a TS packet containing the start of an
+        // elementary stream unit. In H.222.0 a PES start code
+        // ('00 00 01' + stream id) may appear anywhere in the payload
+        // - the bytes before it are the tail of the previous unit and
+        // must be preserved. A start code (or even the whole header)
+        // can straddle into the next TS packet; partial bytes are
+        // staged in pes_pend until the header is complete. Unwrapped
+        // streams (ADTS audio per ISO/IEC 13818-7, some raw muxes)
+        // have no PES header at all.
+        byte buf[288 + 204];
+        int  blen;
+        int  had_pend;
 
         if (need_packet_start)
           need_packet_start = FALSE;
 
-        // Unwrapped AAC (ADTS, ISO/IEC 13818-7): the access unit starts
-        // with the 0xFFF sync (byte 1 is 0xF0-0xF3) and layer '00'.
-        // There is no PES header to strip - and reading payload[4..5]
-        // as a "PES packet length" would just give ADTS header bytes,
-        // so we must not clamp continuation packets to it either.
-        // Without this check the MPEG-1 PES heuristics below mangled
-        // every ADTS frame header (dropping several bytes per frame).
-        if (payload_len >= 7 && payload[0] == 0xFF &&
-            (payload[1] & 0xF0) == 0xF0 && ((payload[1] >> 1) & 3) == 0)
+        if (!pes_stream && !adts_stream)
         {
+          pusi_seen ++;
+          if (find_pes_start(payload,payload_len,0) >= 0)
+          {
+            pes_stream = TRUE;
+            if (verbose)
+              fprint_msg("PES start code found - treating as PES stream\n");
+          }
+          else if (pusi_seen >= 4 && payload_len >= 2 &&
+                   payload[0] == 0xFF && (payload[1] & 0xF0) == 0xF0)
+          {
+            adts_stream = TRUE;
+            if (verbose)
+              fprint_msg("No PES start code in first %d PUSI packets -\n"
+                         "treating as unwrapped AAC (ADTS)\n",pusi_seen);
+          }
+        }
+        if (adts_stream)
+        {
+          // Unwrapped AAC (ADTS, ISO/IEC 13818-7): the unit starts with
+          // the 0xFFF sync. Never scan an ADTS payload for a "PES"
+          // start - AAC frame bodies can contain '00 00 01' byte runs.
           if (verbose)
             fprint_msg("Unwrapped AAC (ADTS) - passing raw data\n");
-          got_pes_packet_len = FALSE;
-          data = payload;
-          data_len = payload_len;
+          pes_unit_open = FALSE;
+          pes_unit_left = 0;
+          if (write_es_bytes(output,payload,payload_len))
+            return 1;
+          extracted ++;
+          continue;
         }
-        else
-        {
-          pes_packet_len = (payload[4] << 8) | payload[5];
-          if (verbose) fprint_msg("PES packet length %d\n",pes_packet_len);
-          got_pes_packet_len = (pes_packet_len > 0);
 
-          if (IS_H222_PES(payload))
+        had_pend = pes_pend_len;
+        blen = had_pend;
+        memcpy(buf,pes_pend,had_pend);
+        memcpy(buf + had_pend,payload,payload_len);
+        blen += payload_len;
+        pes_pend_len = 0;
+
+        do
+        {
+          int  pos = 0;
+          int  f;
+          int  unit_pos;
+          int  unit_left;
+
+          if (had_pend >= 4)
           {
-            // It's H.222.0 - payload[8] is the PES_header_data_length,
-            // so our ES data starts that many bytes after that field
-            offset = payload[8] + 9;
+            // A partial PES header staged from the previous packet
+            // (start code + id are within the staged bytes).
+            if (parse_pes_header(buf,blen,0,pes_pend,&pes_pend_len,
+                                 &pes_hdr_total,&unit_pos,&unit_left,
+                                 verbose))
+              break;             // staged for the next packet
+            pos = unit_pos;
+            pes_unit_left = unit_left;
+            pes_unit_open = TRUE;
+          }
+          else if (had_pend > 0)
+          {
+            // A partial start code (1-3 staged bytes) staged from the
+            // previous packet.
+            f = find_pes_start(buf,blen,0);
+            if (f < 0)
+            {
+              // Still incomplete: a start code straddling 3+ packets is
+              // pathological - flush everything (staged bytes included)
+              // as ES and give up staging.
+              if (write_es_bytes(output,buf,blen))
+                return 1;
+              break;
+            }
+            if (f > had_pend)
+            {
+              // The staged bytes were not part of the start code after
+              // all: they are ES (tail of the previous unit) - write
+              // them with the payload bytes before the start code.
+              if (write_es_bytes(output,buf,f))
+                return 1;
+            }
+            if (parse_pes_header(buf,blen,f,pes_pend,&pes_pend_len,
+                                 &pes_hdr_total,&unit_pos,&unit_left,
+                                 verbose))
+              break;             // staged for the next packet
+            pos = unit_pos;
+            pes_unit_left = unit_left;
+            pes_unit_open = TRUE;
+          }
+          else if (!pes_unit_open)
+          {
+            // Fresh start: find the unit's start code.
+            f = find_pes_start(buf,blen,0);
+            if (f < 0)
+            {
+              // No start code: raw data (unwrapped stream, or a start
+              // code straddling into the next packet). We must NOT
+              // read buf[4..5] as a "PES packet length": for unwrapped
+              // streams those are just ES bytes, and clamping
+              // continuation packets to it silently dropped data -
+              // this used to mangle every ADTS frame and lost chunks
+              // of raw H.264 streams.
+              if (verbose)
+                fprint_msg("No PES header at unit start - passing raw data\n");
+              pes_unit_open = FALSE;
+              pes_unit_left = 0;
+              if (write_es_bytes(output,buf,blen))
+                return 1;
+              break;
+            }
+            if (f > 0)
+            {
+              // Preserve the bytes before the PES start (tail of the
+              // previous unit) - the old code assumed the header was
+              // at payload[0] and dropped them.
+              if (verbose)
+                fprint_msg("PES start at offset %d\n",f);
+              if (write_es_bytes(output,buf,f))
+                return 1;
+            }
+            pes_unit_open = TRUE;
+            if (parse_pes_header(buf,blen,f,pes_pend,&pes_pend_len,
+                                 &pes_hdr_total,&pos,&pes_unit_left,
+                                 verbose))
+              break;             // staged for the next packet
           }
           else
           {
-            // We assume it's MPEG-1
-            offset = calc_mpeg1_pes_offset(payload,payload_len);
+            // A unit from a previous packet is in flight; this PUSI
+            // packet carries its tail and the start of the next unit.
+            f = find_pes_start(buf,blen,0);
+            if (f < 0)
+            {
+              if (pes_unit_left > 0 && pes_unit_left <= blen)
+              {
+                // The in-flight unit (declared length) ends inside
+                // this packet; anything after it is a start code
+                // straddling into the next packet (at most 3 bytes).
+                int rest = blen - pes_unit_left;
+                if (write_es_bytes(output,buf,pes_unit_left))
+                  return 1;
+                pes_unit_left = 0;
+                pes_unit_open = FALSE;
+                if (rest <= 3 && rest > 0)
+                {
+                  memcpy(pes_pend,buf + blen - rest,rest);
+                  pes_pend_len = rest;
+                  pes_hdr_total = 0;
+                }
+                else if (rest > 3)
+                {
+                  // No start code here (malformed): preserve bytes.
+                  if (write_es_bytes(output,buf + (blen - rest),rest))
+                    return 1;
+                }
+              }
+              else
+              {
+                // The unit (unknown length, or longer than this
+                // packet) carries on: raw.
+                if (write_es_bytes(output,buf,blen))
+                  return 1;
+                if (pes_unit_left > 0)
+                  pes_unit_left -= blen;
+              }
+              break;
+            }
+            {
+              int lead = f;
+              if (pes_unit_left > 0)
+              {
+                // The in-flight unit ends at or before the start code.
+                if (pes_unit_left < f)
+                  lead = pes_unit_left;
+                pes_unit_left = 0;
+              }
+              if (lead > 0 && write_es_bytes(output,buf,lead))
+                return 1;
+              if (f > lead &&
+                  write_es_bytes(output,buf + lead,f - lead))
+                return 1;        // gap bytes (shouldn't happen)
+              pes_unit_open = TRUE;
+              if (parse_pes_header(buf,blen,f,pes_pend,&pes_pend_len,
+                                   &pes_hdr_total,&pos,&pes_unit_left,
+                                   verbose))
+                break;           // staged for the next packet
+            }
           }
-          data = &payload[offset];
-          data_len = payload_len-offset;
-          if (verbose) print_data(TRUE,"data",data,data_len,1000);
-        }
+
+          if (emit_unit_es(buf,blen,&pos,pes_pend,&pes_pend_len,
+                           &pes_hdr_total,&pes_unit_left,output))
+            return 1;
+        } while (0);
+        extracted ++;
+        continue;
       }
       else
       {
+        byte buf[288 + 204];
+        int  blen;
+        int  had_pend;
+        int  pos;
+
         // If we haven't *started* a packet, we can't use this,
         // since it will just look like random bytes when written out.
         if (need_packet_start)
@@ -264,35 +661,123 @@ static int extract_pid_packets(TS_reader_p  tsreader,
             continue;
           }
 
-        data = payload;
-        data_len = payload_len;
-        if (verbose) print_data(TRUE,"Data",payload,payload_len,1000);
+        had_pend = pes_pend_len;
+        blen = had_pend;
+        memcpy(buf,pes_pend,had_pend);
+        memcpy(buf + had_pend,payload,payload_len);
+        blen += payload_len;
+        pes_pend_len = 0;
 
-        if (got_pes_packet_len)
+        pos = 0;
+        if (had_pend > 0)
         {
-          // Try not to write more data than the PES packet declares
-          if (data_len > pes_packet_len)
+          int  f;
+          int  unit_pos;
+          int  unit_left;
+
+          if (had_pend >= 4)
           {
-            data_len = pes_packet_len;
-            if (verbose) print_data(TRUE,"Reduced data",data,data_len,1000);
-            pes_packet_len = 0;
+            // Complete a partial PES header staged from the previous
+            // packet (start code + id are within the staged bytes).
+            if (parse_pes_header(buf,blen,0,pes_pend,&pes_pend_len,
+                                 &pes_hdr_total,&unit_pos,&unit_left,
+                                 verbose))
+              {
+                extracted ++;
+                continue;        // staged for the next packet
+              }
+            pos = unit_pos;
+            pes_unit_left = unit_left;
+            pes_unit_open = TRUE;
           }
           else
-            pes_packet_len -= data_len;
+          {
+            // Complete a partial start code staged from the previous
+            // packet.
+            f = find_pes_start(buf,blen,0);
+            if (f < 0)
+            {
+              // Still incomplete: a start code straddling 3+ packets is
+              // pathological - flush everything (staged bytes included)
+              // as ES and give up staging.
+              if (write_es_bytes(output,buf,blen))
+                return 1;
+              extracted ++;
+              continue;
+            }
+            if (f > had_pend)
+            {
+              // The staged bytes were not part of the start code after
+              // all: they are ES (tail of the previous unit).
+              if (write_es_bytes(output,buf,f))
+                return 1;
+            }
+            if (parse_pes_header(buf,blen,f,pes_pend,&pes_pend_len,
+                                 &pes_hdr_total,&unit_pos,&unit_left,
+                                 verbose))
+              {
+                extracted ++;
+                continue;        // staged for the next packet
+              }
+            pos = unit_pos;
+            pes_unit_left = unit_left;
+            pes_unit_open = TRUE;
+          }
         }
-      }
-      if (data_len > 0)
-      {
-        // Windows doesn't seem to like writing 0 bytes, so be careful...
-        written = fwrite(data,data_len,1,output);
-        if (written != 1)
+        else if (!pes_unit_open)
         {
-          fprint_err("### Error writing TS packet - units written = %d\n",
-                     (int)written);
-          return 1;
+          // A continuation with no unit in flight (stream started
+          // mid-flight, or a raw unwrapped stream): pass through.
+          if (verbose)
+            print_data(TRUE,"Data",payload,payload_len,1000);
+          if (write_es_bytes(output,payload,payload_len))
+            return 1;
+          extracted ++;
+          continue;
         }
+
+        {
+          int avail = blen - pos;
+          int w = avail;
+          if (pes_unit_left > 0 && w > pes_unit_left)
+            w = pes_unit_left;
+          if (write_es_bytes(output,buf + pos,w))
+            return 1;
+          pos += w;
+          if (pes_unit_left > 0)
+          {
+            pes_unit_left -= w;
+          }
+          else
+          {
+            // The unit ended inside this continuation packet (only
+            // possible for declared-length units): the trailing bytes
+            // are a start code straddling the next packet (hold them)
+            // or malformed (preserve them).
+            int  rest = blen - pos;
+            int  prefix = 0;
+
+            if (rest == 3 && buf[pos] == 0 && buf[pos+1] == 0 &&
+                buf[pos+2] == 1)
+              prefix = 3;
+            else
+              while (prefix < rest && buf[pos + prefix] == 0)
+                prefix ++;
+            if (prefix > 0 && prefix == rest)
+            {
+              memcpy(pes_pend,buf + pos,rest);
+              pes_pend_len = rest;
+              pes_hdr_total = 0;
+            }
+            else if (rest > 0)
+            {
+              if (write_es_bytes(output,buf + pos,rest))
+                return 1;
+            }
+          }
+        }
+        extracted ++;
       }
-      extracted ++;
     }
   }
 
